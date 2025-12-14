@@ -77,7 +77,7 @@ async fn main() -> io::Result<()> {
                 .long("tun")
                 .required(false)
                 .value_name("tunX")
-                .help("Sets the Tun interface name prefix, if absent, pick the next available name")
+                .help("Sets the Tun interface name, if absent, pick the next available name")
                 .default_value(""),
         )
         .arg(
@@ -126,17 +126,12 @@ async fn main() -> io::Result<()> {
         .unwrap()
         .parse()
         .expect("bad peer address for Tun interface");
-    let tun_local6 = matches
+    let tun_local6: Option<std::net::Ipv6Addr> = matches
         .get_one::<String>("tun_local6")
         .map(|v| v.parse().expect("bad local IPv6 address for Tun interface"));
-    let tun_peer6 = matches
+    let tun_peer6: Option<std::net::Ipv6Addr> = matches
         .get_one::<String>("tun_peer6")
         .map(|v| v.parse().expect("bad peer IPv6 address for Tun interface"));
-    let poll_interval = matches
-        .get_one::<String>("poll_interval")
-        .unwrap()
-        .parse::<u64>()
-        .expect("invalid poll interval");
 
     info!("Phantun Client Daemon starting...");
     info!("Watching directory: {}", watch_dir.display());
@@ -146,6 +141,35 @@ async fn main() -> io::Result<()> {
         fs::create_dir_all(&watch_dir)?;
         info!("Created watch directory: {}", watch_dir.display());
     }
+
+    // Create TUN interface ONCE for all clients
+    let num_cpus = num_cpus::get();
+    info!("{} cores available", num_cpus);
+
+    let tun = TunBuilder::new()
+        .name(&tun_name)
+        .up()
+        .address(tun_local)
+        .destination(tun_peer)
+        .queues(num_cpus)
+        .build()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to create TUN device: {}", e),
+            )
+        })?;
+
+    // Assign IPv6 if needed (check if any configuration will need it)
+    if let (Some(local6), Some(peer6)) = (tun_local6, tun_peer6) {
+        assign_ipv6_address(tun[0].name(), local6, peer6);
+        info!("Assigned IPv6 addresses to TUN device");
+    }
+
+    info!("Created TUN device {}", tun[0].name());
+
+    // Create the shared Stack for all clients
+    let stack = Arc::new(RwLock::new(Stack::new(tun, tun_peer, tun_peer6)));
 
     let clients = Arc::new(RwLock::new(HashMap::<String, ClientInstance>::new()));
 
@@ -169,36 +193,32 @@ async fn main() -> io::Result<()> {
     info!("File watcher initialized successfully");
 
     // Do initial scan
-    if let Err(e) = process_directory(&watch_dir, &clients, tun_name.clone(), tun_local, tun_peer, tun_local6, tun_peer6).await {
+    if let Err(e) = process_directory(&watch_dir, &clients, &stack).await {
         error!("Initial directory scan failed: {}", e);
     }
 
     // Process file system events
     loop {
         tokio::select! {
-                Some(event) = rx.recv() => {
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                            debug!("File system event: {:?}", event);
-                            if let Err(e) = process_directory(&watch_dir, &clients, tun_name.clone(), tun_local, tun_peer, tun_local6, tun_peer6).await {
-                                error!("Failed to process directory changes: {}", e);
-                            }
+            Some(event) = rx.recv() => {
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                        debug!("File system event: {:?}", event);
+                        if let Err(e) = process_directory(&watch_dir, &clients, &stack).await {
+                            error!("Failed to process directory changes: {}", e);
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
+        }
     }
 }
 
 async fn process_directory(
     watch_dir: &Path,
     clients: &Arc<RwLock<HashMap<String, ClientInstance>>>,
-    tun_name: String,
-    tun_local: Ipv4Addr,
-    tun_peer: Ipv4Addr,
-    tun_local6: Option<std::net::Ipv6Addr>,
-    tun_peer6: Option<std::net::Ipv6Addr>,
+    stack: &Arc<RwLock<Stack>>,
 ) -> io::Result<()> {
     let current_files = scan_directory(watch_dir).await?;
 
@@ -263,16 +283,12 @@ async fn process_directory(
         let client_cancel = cancel_token.clone();
 
         let client_config = config.clone();
-        let client_tun_name = tun_name.clone();
+        let stack_clone = stack.clone();
 
         tokio::spawn(async move {
             if let Err(e) = run_client(
                 client_config,
-                client_tun_name,
-                tun_local,
-                tun_peer,
-                tun_local6,
-                tun_peer6,
+                stack_clone,
                 client_cancel,
             )
                 .await
@@ -311,47 +327,21 @@ async fn scan_directory(dir: &Path) -> io::Result<HashMap<String, PathBuf>> {
 
 async fn run_client(
     config: ClientConfig,
-    tun_name: String,
-    tun_local: Ipv4Addr,
-    tun_peer: Ipv4Addr,
-    tun_local6: Option<std::net::Ipv6Addr>,
-    tun_peer6: Option<std::net::Ipv6Addr>,
+    stack: Arc<RwLock<Stack>>,
     cancel_token: CancellationToken,
 ) -> io::Result<()> {
     let client_name = config.name.clone();
     let local_addr = config.local;
     let remote_addr = config.remote;
 
-    let num_cpus = num_cpus::get();
-
-    let tun = TunBuilder::new()
-        .name(&tun_name)
-        .up()
-        .address(tun_local)
-        .destination(tun_peer)
-        .queues(num_cpus)
-        .build()
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to create TUN device for client '{}': {}", client_name, e),
-            )
-        })?;
-
-    if remote_addr.is_ipv6() && tun_local6.is_some() && tun_peer6.is_some() {
-        assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
-    }
-
     info!(
-        "Client '{}': Created TUN device {}",
-        client_name,
-        tun[0].name()
+        "Client '{}': Starting with local={}, remote={}",
+        client_name, local_addr, remote_addr
     );
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
-
-    let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    let num_cpus = num_cpus::get();
 
     let mut buf_r = [0u8; MAX_PACKET_LEN];
 
@@ -366,7 +356,13 @@ async fn run_client(
                 }
 
                 info!("Client '{}': New UDP client from {}", client_name, udp_remote_addr);
-                let sock = stack.connect(remote_addr).await;
+
+                // Connect using the shared stack
+                let sock = {
+                    let mut stack_lock = stack.write().await;
+                    stack_lock.connect(remote_addr).await
+                };
+
                 if sock.is_none() {
                     error!("Client '{}': Unable to connect to remote {}", client_name, remote_addr);
                     continue;
